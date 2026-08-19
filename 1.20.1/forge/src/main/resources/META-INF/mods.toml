@@ -1,0 +1,39 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="gto_cpu_fix"
+version="${mod_version}"
+displayName="GTO ME CPU Fix (idle CPU refill)"
+description='''
+修復：ME超算核心分裂出的 CPU，只有「忙碌中的全部＋恰好一顆空閒」會被暴露給 ME 網路，而補上下一顆空閒 CPU 要等 part 自己的週期刷新。那顆空閒 CPU 一被下單佔用，網路就有一段時間看不到任何可用 CPU（終端 CPU 列表短暫消失、期間下單拿不到 CPU）。本 mod 在 AE2 的 CraftingService 每 tick 檢查，發現暴露清單裡沒有空閒 CPU 就立刻從被藏起來的那些補上一顆。
+'''
+
+[[dependencies.gto_cpu_fix]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.gto_cpu_fix]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.gto_cpu_fix]]
+    modId="ae2"
+    mandatory=true
+    versionRange="*"
+    ordering="AFTER"
+    side="BOTH"
+
+[[dependencies.gto_cpu_fix]]
+    modId="gtocore"
+    mandatory=true
+    versionRange="*"
+    ordering="AFTER"
+    side="BOTH"

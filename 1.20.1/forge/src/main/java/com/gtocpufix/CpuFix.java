@@ -1,6 +1,7 @@
 package com.gtocpufix;
 
 import appeng.api.networking.IGrid;
+import appeng.api.networking.security.IActionSource;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
 
 import org.apache.logging.log4j.LogManager;
@@ -68,6 +69,12 @@ public final class CpuFix {
     private static final int VERBOSE_LIMIT = 5;
 
     private static final AtomicLong REFILLS = new AtomicLong();
+
+    /** [1.1.0] 按需補位的總開關；出事用 {@code -Dgtocpufix.onDemand=false} 一鍵退回 1.0.0 行為。 */
+    private static final boolean ON_DEMAND =
+            !"false".equalsIgnoreCase(System.getProperty("gtocpufix.onDemand", "true"));
+
+    private static final AtomicLong ON_DEMAND_HITS = new AtomicLong();
 
     private static boolean resolved;
     private static boolean disabled;
@@ -184,6 +191,118 @@ public final class CpuFix {
         }
     }
 
+    /**
+     * [1.1.0] <b>按需補位</b>：在 {@code CraftingService.submitJob} 的 HEAD 呼叫，
+     * 確保「這一次提交」看得到一顆可用的 CPU。
+     *
+     * <p><b>為什麼每 tick 補一顆不夠</b>：所有請求器是在<b>同一個 tick 的同一毫秒</b>送單的。
+     * 1.0.0 在 {@code onServerEndTick} 的 HEAD 補一顆，第一個請求把它占走之後就變忙碌，
+     * 同 tick 後面每一個 {@code submitJob} 一律 {@code NO_SUITABLE_CPU_FOUND}，要等下一 tick。
+     * 於是不管超算核心分裂出幾顆，<b>併發開單數永遠是 1</b>。
+     *
+     * <p>實測（2026-08-23，把 AE2 的 {@code errorDetail} 印出來）：55 次 {@code NO_SUITABLE_CPU_FOUND}
+     * 全部是 {@code UnsuitableCpus[offline=0, busy=1~4, tooSmall=0, excluded=0]}——
+     * {@code tooSmall} 與 {@code excluded} 恆為 0，代表既不是容量也不是 CpuSelectionMode，
+     * 純粹是「AE2 看得見的 1~4 顆全在忙」，而完整清單有 256 顆。同一場 cpufix 反射讀到的
+     * 「暴露 2/3/4 顆 / 共 256 顆」與 AE2 的 {@code busy} 計數完全一致。
+     *
+     * <p><b>掛在 submitJob 而不是 tick 的意義</b>：同 tick 內 M 個請求會觸發 M 次，各拿到自己的
+     * 一顆，不需要任何「要暴露幾顆」的設定值——之後加多少請求器都自動跟上。
+     *
+     * <p>過濾條件照抄 AE2 {@code submitJob} 選 CPU 的四道，避免補上去一顆它照樣不收：
+     * {@code isActive() && !isBusy() && getAvailableStorage() >= bytes && canBeAutoSelectedFor(src)}。
+     *
+     * @return true 表示有補進 {@code serviceCpus}（呼叫端不必再做別的，這一次選 CPU 就看得到）
+     */
+    public static boolean ensureIdleForSubmit(IGrid grid, Set<CraftingCPUCluster> serviceCpus,
+                                              long bytes, IActionSource src) {
+        if (!ON_DEMAND || grid == null || serviceCpus == null || !resolve()) return false;
+        // AE2 這一次就選得到 → 不插手
+        if (hasUsable(serviceCpus, bytes, src)) return false;
+
+        Set<?> parts;
+        try {
+            parts = grid.getMachines(partClass);
+        } catch (Throwable t) {
+            disable("向 grid 取合成CPU接口失敗：" + t);
+            return false;
+        }
+        if (parts == null || parts.isEmpty()) return false;
+
+        for (Object part : parts) {
+            List<?> exposed;
+            List<?> full;
+            try {
+                exposed = (List<?>) getClustersMethod.invoke(part);
+                full = (List<?>) fullListField.get(part);
+            } catch (Throwable t) {
+                disable("讀取合成CPU接口的 CPU 清單失敗：" + t);
+                return false;
+            }
+            if (exposed == null || full == null || exposed == full) continue;
+
+            CraftingCPUCluster spare = findUsable(full, serviceCpus, bytes, src);
+            if (spare == null) continue; // 這個 part 真的沒有合用的空閒 CPU
+
+            // 先進暴露清單（讓它在 gtolib／AE2 下次重建時活下來），失敗不影響本次
+            if (!exposedImmutable) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    List<Object> sink = (List<Object>) exposed;
+                    if (!containsIdentity(exposed, spare)) sink.add(spare);
+                } catch (UnsupportedOperationException e) {
+                    exposedImmutable = true;
+                }
+            }
+            // 關鍵：直接進 AE2 這一次要遍歷的集合。等 updateList 到下一 tick 就來不及了。
+            if (serviceCpus.add(spare)) {
+                logOnDemand(part, exposed.size(), full.size(), spare);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 照抄 AE2 submitJob 選 CPU 的四道過濾。 */
+    private static boolean usable(CraftingCPUCluster c, long bytes, IActionSource src) {
+        try {
+            return c != null && !c.isDestroyed() && c.isActive() && !c.isBusy()
+                    && c.getAvailableStorage() >= bytes
+                    && (src == null || c.canBeAutoSelectedFor(src));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean hasUsable(Set<CraftingCPUCluster> cpus, long bytes, IActionSource src) {
+        for (CraftingCPUCluster c : cpus) {
+            if (usable(c, bytes, src)) return true;
+        }
+        return false;
+    }
+
+    private static CraftingCPUCluster findUsable(List<?> full, Set<CraftingCPUCluster> already,
+                                                 long bytes, IActionSource src) {
+        for (Object o : full) {
+            if (!(o instanceof CraftingCPUCluster c)) continue;
+            if (already.contains(c)) continue;
+            if (usable(c, bytes, src)) return c;
+        }
+        return null;
+    }
+
+    private static void logOnDemand(Object part, int exposedSize, int fullSize,
+                                    CraftingCPUCluster spare) {
+        long n = ON_DEMAND_HITS.incrementAndGet();
+        if (n > VERBOSE_LIMIT) return;
+        report("[cpufix] 按需補位 #{}：{} 這次提交時暴露清單沒有可用 CPU"
+                + "（暴露 {} 顆 / 共 {} 顆），已就地補一顆（可用 {} bytes）。",
+                n, describe(part), exposedSize, fullSize, spare.getAvailableStorage());
+        if (n == VERBOSE_LIMIT) {
+            report("[cpufix] 之後的按需補位不再逐次記錄，停機時會印總次數。");
+        }
+    }
+
     /** 盡量印出機器座標；拿不到就退回類別名。 */
     private static String describe(Object part) {
         try {
@@ -271,7 +390,8 @@ public final class CpuFix {
     public static void logSummary() {
         long n = REFILLS.get();
         if (n > 0) {
-            report("[cpufix] 本次遊玩共補位 {} 次（每次都是 ME超算核心暴露的 CPU 全忙、空窗被補上）。", n);
+            report("[cpufix] 本次遊玩共補位 {} 次（週期空窗）＋ {} 次（按需，submitJob 當下沒有可用 CPU）。",
+                    n, ON_DEMAND_HITS.get());
         }
     }
 

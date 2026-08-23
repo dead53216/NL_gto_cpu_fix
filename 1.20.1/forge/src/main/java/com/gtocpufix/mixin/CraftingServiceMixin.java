@@ -4,6 +4,11 @@ import com.gtocpufix.CpuFix;
 import com.gtocpufix.CpuFixApplied;
 
 import appeng.api.networking.IGrid;
+import appeng.api.networking.crafting.ICraftingCPU;
+import appeng.api.networking.crafting.ICraftingPlan;
+import appeng.api.networking.crafting.ICraftingRequester;
+import appeng.api.networking.crafting.ICraftingSubmitResult;
+import appeng.api.networking.security.IActionSource;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
 import appeng.me.service.CraftingService;
 
@@ -13,6 +18,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.Set;
 
@@ -57,5 +63,30 @@ public abstract class CraftingServiceMixin implements CpuFixApplied {
             // 補進去的那顆還沒進 AE2 的 CPU 集合；讓它在這一 tick 立刻重建。
             updateList = true;
         }
+    }
+
+    /**
+     * [1.1.0] 第二個掛點：<b>每一次提交</b>都確保看得到一顆可用 CPU。
+     *
+     * <p>上面那個每 tick 只補一顆，而所有請求器是在同一 tick 的同一毫秒送單的——第一個把它
+     * 占走之後，同 tick 後面每一個 {@code submitJob} 一律 {@code NO_SUITABLE_CPU_FOUND}。
+     * 所以不管超算核心分裂出幾顆，併發開單數永遠是 1。掛在 HEAD 讓同 tick 的 M 個請求觸發
+     * M 次補位，各拿到自己的一顆。
+     *
+     * <p>補進去的是 {@code craftingCPUClusters} 本體——AE2 這一次選 CPU 就是遍歷它；
+     * 設 {@code updateList} 要等下一 tick 才重建，來不及。HEAD 在遍歷開始前，不會
+     * 造成 ConcurrentModificationException。
+     *
+     * <p>指定了 {@code target} 的提交不插手（AE2 只會用那一顆，補了也沒用）。
+     */
+    @Inject(method = "submitJob", at = @At("HEAD"), remap = false)
+    private void gtocpufix$ensureIdleForSubmit(ICraftingPlan job, ICraftingRequester requestingMachine,
+                                               ICraftingCPU target, boolean prioritizePower,
+                                               IActionSource src,
+                                               CallbackInfoReturnable<ICraftingSubmitResult> cir) {
+        if (target != null || job == null) {
+            return;
+        }
+        CpuFix.ensureIdleForSubmit(grid, craftingCPUClusters, job.bytes(), src);
     }
 }

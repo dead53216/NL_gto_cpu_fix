@@ -87,6 +87,13 @@ public abstract class CraftingServiceMixin implements CpuFixApplied {
         if (target != null || job == null) {
             return;
         }
-        CpuFix.ensureIdleForSubmit(grid, craftingCPUClusters, job.bytes(), src);
+        if (CpuFix.ensureIdleForSubmit(grid, craftingCPUClusters, job.bytes(), src)) {
+            // [1.1.1] 這一次提交靠直接塞 craftingCPUClusters 解決，但那繞過了 AE2 自己的帳：
+            // CraftingService 是 GridCraftingCpuChange 的**接收方**（收到就把 updateList 設 true、
+            // 下一 tick 重建 CPU 集合）。我們無聲地改了那個集合，等於 AE2 的視角跟實際不一致，
+            // 而且下次重建會把塞進去的洗掉。設 updateList 讓它下一 tick 正常重建一次——
+            // 補進去的那顆同時也加進了 part 的暴露清單，所以重建後會被正常撿到。
+            updateList = true;
+        }
     }
 }

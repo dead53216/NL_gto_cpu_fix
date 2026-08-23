@@ -64,22 +64,74 @@ ME超算核心分裂出 N 颗合成 CPU 之后，AE2 应该能同时为多个自
 
 ---
 
-## 量化数据（15 小时单人存档，自制诊断 mod 逐条记录 submitJob 结果）
+## 决定性证据：AE2 自己的 `UnsuitableCpus` 回报
+
+AE2 的 `CraftingService.submitJob` 选不到 CPU 时，回的不是单纯一个错误码，而是
+`CraftingSubmitResult.noSuitableCpu(UnsuitableCpus)`，其中
+
+```java
+record UnsuitableCpus(int offline, int busy, int tooSmall, int excluded)
+```
+
+四个计数对应 `submitJob` 挑 CPU 的四道过滤（依序）：
+
+```java
+isActive() && !isBusy() && getAvailableStorage() >= bytes && canBeAutoSelectedFor(src)
+```
+
+把这个 detail 打出来之后，55 次 `NO_SUITABLE_CPU_FOUND` 的分布是：
 
 ```
-全网机器来源提交：成功 9,886 次 / 被弹回 8,944 次（NO_SUITABLE_CPU_FOUND 占比 47.5%）
+32 次  UnsuitableCpus[offline=0, busy=2, tooSmall=0, excluded=0]
+12 次  UnsuitableCpus[offline=0, busy=3, tooSmall=0, excluded=0]
+ 7 次  UnsuitableCpus[offline=0, busy=4, tooSmall=0, excluded=0]
+ 4 次  UnsuitableCpus[offline=0, busy=1, tooSmall=0, excluded=0]
+```
+
+**全部 55 次，`tooSmall` 和 `excluded` 都是 0**：
+
+- `tooSmall=0` → 不是 CPU 容量不够（每颗可用 129,117,454,336 bytes）
+- `excluded=0` → 不是 CPU 的 `CpuSelectionMode`（PLAYER_ONLY / MACHINE_ONLY）挡掉
+- `offline=0` → 暴露出来的 CPU 都是活的
+- `busy=1~4` → **AE2 看得见的 CPU 一共就只有 1~4 颗，而且每一颗都在忙**
+
+超算核心分裂出来的是 **256 颗**。也就是说 AE2 的候选清单里从头到尾只有 1~4 颗，
+其余 250 多颗它根本看不到。
+
+### 与 gtolib 侧的交叉验证
+
+同一场游戏，另一个方向（反射读 `CraftingInterfacePartMachine` 的两份清单）报出来的数字
+和 AE2 的 `busy` 计数**完全一致**：
+
+```
+21:50:16  暴露 2 颗 / 共 256 颗   ← 同期 AE2 回报 busy=2
+21:50:23  暴露 3 颗 / 共 256 颗   ← 同期 AE2 回报 busy=3
+21:50:31  暴露 3 颗 / 共 256 颗
+21:50:36  暴露 4 颗 / 共 256 颗   ← 同期 AE2 回报 busy=4
+```
+
+两个独立来源互相印证：**AE2 的候选清单 == part 的暴露清单，而暴露清单里没有空闲的**。
+
+---
+
+## 影响面（15 小时单人存档，逐条记录 submitJob 结果）
+
+```
+全网机器来源提交：成功 9,886 次 / 被弹回 8,944 次（NO_SUITABLE_CPU_FOUND 占 47.5%）
 
 按 tick 统计（同一毫秒视为同一 tick）：
   同一 tick 有 >=2 个请求竞争的 tick 数： 5,803
     其中成功 1 张： 5,585  (96.2%)
     其中成功 2 张：    70  ( 1.2%)
     其中成功 0 张：   148
-
-也就是说：即使有 256 颗 CPU、每颗 129 GB bytes，只要同 tick 有人竞争，
-几乎必然只有一张单开得出来。
 ```
 
-同一时间窗（13 分钟）内，各物品的机器单成功率——**与计画大小完全无关**：
+即使有 256 颗 CPU、每颗 129 GB bytes，只要同 tick 有人竞争，几乎必然只有一张单开得出来。
+
+### 副作用：有物品会被结构性饿死
+
+AE2 遍历 CPU / 请求器用的是 `HashSet`，顺序在单次游戏执行中固定。排在后面的物品
+不是「概率性变慢」，而是**每一轮都排在后面**：
 
 ```
 品项                              成功   弹回   成功率   最大 bytes
@@ -91,9 +143,9 @@ liquid_oxygen                      11      1     92%       3,126
 uranium_rod                         9      0    100%           2
 ```
 
-`drilling_fluid`（533,334 bytes）成功而 `tiny_gaia_dust`（92,614 bytes）0/79，
-排除了「CPU 容量不足」；两者同为机器来源，也排除了 CPU 的
-`CpuSelectionMode`（PLAYER_ONLY / MACHINE_ONLY）。
+`rare_earth_metal_dust` 和 `tiny_gaia_dust` 挂在**同一颗请求器**上，一个 51%、
+一个 0/79。玩家手动下单则 13/13 全部成功（最大 995,215 bytes），因为手动的时机
+不落在那个 10 秒轮询节拍上。
 
 原始流水（同一毫秒送单，只有第一个成功）：
 
@@ -105,10 +157,6 @@ uranium_rod                         9      0    100%           2
 20:59:45.16  FAIL rare_earth_metal_dust       6,404B   NO_SUITABLE_CPU_FOUND
 20:59:45.16  FAIL tiny_gaia_dust             92,614B   NO_SUITABLE_CPU_FOUND
 ```
-
-同一颗请求器上，`rare_earth_metal_dust` 成功率 51%、`tiny_gaia_dust` 0/79
-——只因为后者在 HashSet 遍历顺序里永远排在后面。玩家手动下单则每次都成功
-（13/13，最大 995,215 bytes），因为手动的时机不落在那个 10 秒节拍上。
 
 ---
 
